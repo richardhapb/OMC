@@ -4,7 +4,9 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"slices"
@@ -37,8 +39,6 @@ const (
 func main() {
 	connStr := "127.0.0.1:8000"
 	listener, err := net.Listen("tcp", connStr)
-
-	mutex = sync.Mutex{}
 
 	if err != nil {
 		log.Printf("error establishing connection: %s\n", err)
@@ -129,7 +129,9 @@ func handleWebSocket(lines []string, conn net.Conn) {
 	log.Printf("Response to WS connection:\n%s\n", response)
 	log.Println()
 
+	mutex.Lock()
 	wsConnections = append(wsConnections, WebSocket{conn: &conn, connected: true})
+	mutex.Unlock()
 
 	_, err := (conn).Write([]byte(response))
 
@@ -169,7 +171,7 @@ func wsLoop(conn net.Conn) {
 
 func readFrame(conn net.Conn) (opcode byte, payload []byte, err error) {
 	header := make([]byte, 2)
-	_, err = conn.Read(header)
+	_, err = io.ReadFull(conn, header)
 
 	if err != nil {
 		log.Printf("error reading header: %s", err)
@@ -183,7 +185,7 @@ func readFrame(conn net.Conn) (opcode byte, payload []byte, err error) {
 
 	if payloadLen == 126 {
 		extended := make([]byte, 2)
-		_, err = conn.Read(extended)
+		_, err = io.ReadFull(conn, extended)
 
 		if err != nil {
 			return
@@ -191,7 +193,7 @@ func readFrame(conn net.Conn) (opcode byte, payload []byte, err error) {
 		payloadLen = int(binary.BigEndian.Uint16(extended))
 	} else if payloadLen == 127 {
 		extended := make([]byte, 8)
-		_, err = conn.Read(extended)
+		_, err = io.ReadFull(conn, extended)
 
 		if err != nil {
 			return
@@ -202,7 +204,7 @@ func readFrame(conn net.Conn) (opcode byte, payload []byte, err error) {
 	var maskBytes []byte
 	if masked {
 		maskBytes = make([]byte, 4)
-		_, err = conn.Read(maskBytes)
+		_, err = io.ReadFull(conn, maskBytes)
 
 		if err != nil {
 			return
@@ -210,7 +212,7 @@ func readFrame(conn net.Conn) (opcode byte, payload []byte, err error) {
 	}
 
 	payload = make([]byte, payloadLen)
-	_, err = conn.Read(payload)
+	_, err = io.ReadFull(conn, payload)
 
 	if err != nil {
 		return
@@ -237,34 +239,29 @@ func writeFrame(conn net.Conn, payload []byte) error {
 
 func responseMessages(conn net.Conn) {
 
+	type messagesResponse struct {
+		Messages []Message `json:"messages"`
+	}
+
+	body, err := json.Marshal(messagesResponse{messages})
+
+	if err != nil {
+		log.Printf("error marshaling JSON: %s", err)
+		return
+	}
+
 	header := "HTTP/1.1 200 OK\r\n"
 	header += "Content-Type: application/json\r\n"
 	header += "access-control-allow-origin: *\r\n"
 
-	body := "{\"messages\":["
-
-	for _, message := range messages {
-		body += fmt.Sprintf("{\"message\": \"%s\", \"timestamp\": %d},", message.text, message.timestamp)
-	}
-
-	header += fmt.Sprintf("Content-Length: %d", calculateContentLength(body))
+	header += fmt.Sprintf("Content-Length: %d", len(body))
 	header += "\r\n\r\n"
 
-	if strings.HasSuffix(body, ",") {
-		body = body[:len(body)-1]
-	}
+	log.Printf("Response to messages: \n%s\n", header)
+	log.Println(string(body))
 
-	body += "]}"
-
-	response := header + body + "\r\n\r\n"
-
-	log.Printf("Response to messages: \n%s\n", response)
-
-	(conn).Write([]byte(response))
-}
-
-func calculateContentLength(body string) int {
-	return len(body) + 2
+	conn.Write([]byte(header))
+	conn.Write(body)
 }
 
 func calculateAcceptKey(key string) string {
