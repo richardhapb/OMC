@@ -74,13 +74,9 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 
-		// mutex.Lock()
-		// messages = append(messages, Message{text: string(buffer[:n]), timestamp: time.Now().UnixMilli()})
-		// mutex.Unlock()
-
 		handleRequest(buffer, n, conn)
 
-		log.Printf("Received: %s\n", buffer[:n])
+		log.Printf("Received:\n%s\n", buffer[:n])
 	}
 }
 
