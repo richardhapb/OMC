@@ -39,7 +39,7 @@ export default {
                 }
 
                 const data = await response.json();
-                
+
                 // Remove messages after timeout returned from server
                 data.messages.forEach(msg => {
                     const timestamp = msg.timestamp;
