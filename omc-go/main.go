@@ -65,7 +65,6 @@ func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	buffer := make([]byte, 1024)
-	// go removeOldMessages(&messages)
 	for {
 		n, err := conn.Read(buffer)
 
@@ -174,12 +173,13 @@ func readFrame(conn net.Conn) (opcode byte, payload []byte, err error) {
 		return
 	}
 
-	// end := (header[0] & 0x80) != 0 // First byte == 0 indicates end the connection, 0x80 = 1000 0000
+	// fin := (header[0] & 0x80) != 0 // First byte == 0 indicates end the connection, 0x80 = 1000 0000
 	opcode = header[0] & 0x0F
 	masked := (header[1] & 0x80) != 0   // The second byte being 0 indicates that the content is not masked (mandatory for the client). 0x80 = 1000 0000
 	payloadLen := int(header[1] & 0x7F) // Payload length can be 126, which indicates that the next two bytes represent the length. If it is 127, it indicates an extended payload (8 bytes). 0x7F = 0111 1111
 
-	if payloadLen == 126 {
+	switch payloadLen {
+	case 126:
 		extended := make([]byte, 2)
 		_, err = io.ReadFull(conn, extended)
 
@@ -187,7 +187,7 @@ func readFrame(conn net.Conn) (opcode byte, payload []byte, err error) {
 			return
 		}
 		payloadLen = int(binary.BigEndian.Uint16(extended))
-	} else if payloadLen == 127 {
+	case 127:
 		extended := make([]byte, 8)
 		_, err = io.ReadFull(conn, extended)
 
