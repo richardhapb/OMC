@@ -16,24 +16,24 @@ import (
 )
 
 type WebSocket struct {
-	conn	  *net.Conn
+	conn      *net.Conn
 	connected bool
 }
 
 type Message struct {
-	text	  string
-	timestamp int64
+	Text      string `json:"message"`
+	Timestamp int64  `json:"timestamp"`
 }
 
 var (
-	messages	  []Message
-	mutex		  sync.Mutex
+	messages      []Message
+	mutex         sync.Mutex
 	wsConnections []WebSocket
 )
 
 const (
 	MessageDisappearThreshold = 60000 // One minute
-	MagicGUID				  = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	MagicGUID                 = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 )
 
 func main() {
@@ -150,8 +150,8 @@ func wsLoop(conn net.Conn) {
 		if opcode == 1 {
 			mutex.Lock()
 			messages = append(messages, Message{
-				text:	   string(payload),
-				timestamp: time.Now().UnixMilli(),
+				Text:      string(payload),
+				Timestamp: time.Now().UnixMilli(),
 			})
 			mutex.Unlock()
 			log.Printf("Messages: %v\n", messages)
@@ -176,7 +176,7 @@ func readFrame(conn net.Conn) (opcode byte, payload []byte, err error) {
 
 	// end := (header[0] & 0x80) != 0 // First byte == 0 indicates end the connection, 0x80 = 1000 0000
 	opcode = header[0] & 0x0F
-	masked := (header[1] & 0x80) != 0	// The second byte being 0 indicates that the content is not masked (mandatory for the client). 0x80 = 1000 0000
+	masked := (header[1] & 0x80) != 0   // The second byte being 0 indicates that the content is not masked (mandatory for the client). 0x80 = 1000 0000
 	payloadLen := int(header[1] & 0x7F) // Payload length can be 126, which indicates that the next two bytes represent the length. If it is 127, it indicates an extended payload (8 bytes). 0x7F = 0111 1111
 
 	if payloadLen == 126 {
@@ -272,8 +272,8 @@ func removeOldMessages() {
 		mutex.Lock()
 		for i := len(messages) - 1; i >= 0; i-- {
 			now := time.Now().UnixMilli()
-			if now-(messages)[i].timestamp >= MessageDisappearThreshold {
-				log.Printf("Removing message... %s\n", messages[i].text)
+			if now-(messages)[i].Timestamp >= MessageDisappearThreshold {
+				log.Printf("Removing message... %s\n", messages[i].Text)
 				messages = slices.Delete(messages, i, i+1)
 			}
 
