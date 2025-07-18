@@ -2,7 +2,7 @@ use base64::Engine;
 use serde::Serialize;
 use sha1::Digest;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -19,12 +19,14 @@ enum ChatEvent {
 }
 
 struct WebSocket {
-    socket: Mutex<TcpStream>,
+    writer: Mutex<WriteHalf<TcpStream>>,
+    reader: Mutex<ReadHalf<TcpStream>>,
     connected: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct Message {
+    #[serde(rename = "message")]
     text: String,
     timestamp: i64,
 }
@@ -34,6 +36,21 @@ struct Chat {
     tx: Sender<ChatEvent>,
 }
 
+impl Chat {
+    async fn serialize_to_json(&self) -> Result<String, serde_json::Error> {
+        let messages = self.messages.read().await;
+
+        let mut json = String::from("{\"messages\":[");
+        for (i, msg) in messages.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&serde_json::to_string(msg)?);
+        }
+        json.push_str("]}");
+        Ok(json)
+    }
+}
 struct Participants {
     sockets: Mutex<Vec<Arc<WebSocket>>>,
 }
@@ -97,25 +114,19 @@ async fn handle_chat_events(
                 let participants_guard = participants.sockets.lock().await;
                 for participant in participants_guard.iter() {
                     if participant.connected {
-                        send_message_to_client(&participant.socket, &message_text).await?;
+                        send_message_to_client(&participant.writer, &message_text).await?;
                     }
                 }
             }
             ChatEvent::ClientJoined(ws) => {
                 let mut participants_guard = participants.sockets.lock().await;
                 participants_guard.push(ws.clone());
-                println!(
-                    "Client joined to chat: {:?}",
-                    ws.socket.lock().await.local_addr()
-                );
+                println!("Client joined to chat",);
             }
             ChatEvent::ClientLeft(ws) => {
                 let mut participants_guard = participants.sockets.lock().await;
                 participants_guard.retain(|participant| !Arc::ptr_eq(participant, &ws));
-                println!(
-                    "Client left the chat: {:?}",
-                    ws.socket.lock().await.local_addr()
-                );
+                println!("Client left the chat",);
             }
         }
     }
@@ -123,9 +134,11 @@ async fn handle_chat_events(
     Ok(())
 }
 
-async fn send_message_to_client(socket: &Mutex<TcpStream>, message: &str) -> ChatResult {
+async fn send_message_to_client(socket: &Mutex<WriteHalf<TcpStream>>, message: &str) -> ChatResult {
     let mut stream = socket.lock().await;
-    stream.write_all(message.as_bytes()).await?;
+    let mut frame = vec![0x81, message.len() as u8];
+    frame.extend_from_slice(message.as_bytes());
+    stream.write_all(&frame).await?;
     Ok(())
 }
 
@@ -177,7 +190,8 @@ async fn handle_request(buf: &[u8], mut socket: TcpStream, chat: Arc<Chat>) -> W
 }
 
 async fn response_messages(socket: &mut TcpStream, chat: Arc<Chat>) -> ChatResult {
-    let body = serde_json::to_string::<Vec<Message>>(&*chat.messages.read().await)?;
+    let body = chat.serialize_to_json().await?;
+    println!("{:?}", body);
 
     let mut header = String::from("HTTP/1.1 200 OK\r\n");
     header.push_str("Content-Type: application/json\r\n");
@@ -232,8 +246,11 @@ async fn handle_websocket(buf: &[u8], mut socket: TcpStream, chat: Arc<Chat>) ->
 }
 
 async fn ws_loop(socket: TcpStream, chat: Arc<Chat>) -> WsResult {
+    let (reader, writer) = tokio::io::split(socket);
+
     let new_participant = WebSocket {
-        socket: Mutex::new(socket),
+        writer: Mutex::new(writer),
+        reader: Mutex::new(reader),
         connected: true,
     };
 
@@ -244,7 +261,7 @@ async fn ws_loop(socket: TcpStream, chat: Arc<Chat>) -> WsResult {
         .await?;
 
     loop {
-        match read_frame(&ws_arc.socket).await {
+        match read_frame(&ws_arc.reader).await {
             Ok(Some(message)) => {
                 chat.tx
                     .send(ChatEvent::NewMessage(Message {
@@ -267,14 +284,12 @@ async fn ws_loop(socket: TcpStream, chat: Arc<Chat>) -> WsResult {
 }
 
 async fn read_frame(
-    socket: &Mutex<TcpStream>,
+    reader: &Mutex<ReadHalf<TcpStream>>,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stream = socket.lock().await;
-
+    let mut reader_guard = reader.lock().await;
     let mut header_buf = [0u8; 2];
     // Check if read_exact actually reads 2 bytes or if the connection closed
-    let bytes_read = stream.read_exact(&mut header_buf).await?;
-    println!("Read frame bytes: {}", bytes_read);
+    let bytes_read = reader_guard.read_exact(&mut header_buf).await?;
     if bytes_read == 0 {
         // This case handles EOF right at the start of a frame
         return Ok(None);
@@ -291,11 +306,11 @@ async fn read_frame(
 
     if payload_len == 126 {
         let mut extended = [0u8; 2];
-        stream.read_exact(&mut extended).await?;
+        reader_guard.read_exact(&mut extended).await?;
         payload_len = ((extended[0] as usize) << 8) | (extended[1] as usize);
     } else if payload_len == 127 {
         let mut extended = [0u8; 8];
-        stream.read_exact(&mut extended).await?;
+        reader_guard.read_exact(&mut extended).await?;
         payload_len = ((extended[0] as usize) << 56)
             | ((extended[1] as usize) << 48)
             | ((extended[2] as usize) << 40)
@@ -310,14 +325,14 @@ async fn read_frame(
         0x1 => {
             let masking_key = if masked {
                 let mut mask_bytes = [0u8; 4];
-                stream.read_exact(&mut mask_bytes).await?;
+                reader_guard.read_exact(&mut mask_bytes).await?;
                 Some(mask_bytes)
             } else {
                 None
             };
 
             let mut payload = vec![0; payload_len];
-            stream.read_exact(&mut payload).await?;
+            reader_guard.read_exact(&mut payload).await?;
 
             if let Some(mask) = masking_key {
                 for i in 0..payload_len {
@@ -326,27 +341,26 @@ async fn read_frame(
             }
 
             let message = String::from_utf8_lossy(&payload).to_string();
-            println!("Read: {}", message);
 
             Ok(Some(message))
         }
         0x8 => {
             // Read any remaining payload for the close frame to ensure stream is clear
             let mut _discard_payload = vec![0; payload_len];
-            stream.read_exact(&mut _discard_payload).await?;
+            reader_guard.read_exact(&mut _discard_payload).await?;
             if masked {
                 let mut _discard_mask = [0u8; 4];
-                stream.read_exact(&mut _discard_mask).await?;
+                reader_guard.read_exact(&mut _discard_mask).await?;
             }
             Err("WebSocket connection closed".into())
         }
         _ => {
             // Discard payload for unknown frame types
             let mut _discard_payload = vec![0; payload_len];
-            stream.read_exact(&mut _discard_payload).await?;
+            reader_guard.read_exact(&mut _discard_payload).await?;
             if masked {
                 let mut _discard_mask = [0u8; 4];
-                stream.read_exact(&mut _discard_mask).await?;
+                reader_guard.read_exact(&mut _discard_mask).await?;
             }
             Ok(None)
         }
@@ -362,12 +376,15 @@ fn calculate_accepted_key(key: String) -> String {
 
 async fn remove_old_messages(chat: Arc<Chat>) {
     loop {
+        let time_threshold = chrono::Utc::now()
+            - chrono::TimeDelta::new(60, 0).expect("should be a correct time delta");
         {
             let mut chat_guard = chat.messages.write().await;
-            let time_threshold = chrono::Utc::now()
-                - chrono::TimeDelta::new(360, 0).expect("should be a correct time delta");
-
+            let before = chat_guard.len();
             chat_guard.retain(|m| m.timestamp >= time_threshold.timestamp_millis());
+            if chat_guard.len() < before {
+                println!("Updated messages: {:?}", chat_guard);
+            }
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
